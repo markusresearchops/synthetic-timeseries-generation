@@ -1,126 +1,118 @@
-"""Command-line interface for synthetic data generation."""
+"""CLI: generate synthetic OHLCV bars via paper-faithful KernelSynth + TSMixup.
+
+Output is parquet in tokenized-forecaster's per-symbol-year format
+(`year=<Y>.parquet` with a `symbol` column), so the downstream pipeline
+can ingest it directly via `consolidate-bars` or by dropping into the
+consolidated layout.
+
+Usage:
+    chronos-synth kernelsynth --n 100 --output-dir ./out
+    chronos-synth tsmixup --source data.parquet --column close --n 1000 --output ./mix.parquet
+"""
+
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
 
-from .synthetic_dataset import SyntheticDatasetGenerator
+import numpy as np
+import pandas as pd
+
+from .chronos_kernel_synth import generate_kernel_synth_dataset
+from .ohlcv_adapter import OHLCVConfig, batch_to_ohlcv
+from .tsmixup import generate_tsmixup_dataset, parquet_column_source
 
 
-def main():
-    """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="Generate synthetic OHLCV data for stock forecasting model training.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-
-  # Generate 50 symbols using Gaussian Processes
-  generate-gp-synthetic --method gp --n-symbols 50 --n-bars 2000 --output-dir ./synthetic
-
-  # Generate using parametric ensemble (GBM + mean-revert + regime-switch + SV)
-  generate-gp-synthetic --method parametric --n-symbols 40 --output-dir ./synthetic
-
-  # Use Matern kernel for smoother paths
-  generate-gp-synthetic --method gp --n-symbols 20 --kernel-type matern --output-dir ./synthetic
-        """,
+def _cmd_kernelsynth(args: argparse.Namespace) -> int:
+    print(f"generating {args.n} synthetic series via KernelSynth (l_syn={args.length})...")
+    series = generate_kernel_synth_dataset(
+        n_series=args.n, l_syn=args.length, j_max=args.j_max, seed=args.seed,
     )
-
-    parser.add_argument(
-        "--method",
-        choices=["gp", "parametric"],
-        default="gp",
-        help="Generation method (default: gp)",
-    )
-    parser.add_argument(
-        "--n-symbols",
-        type=int,
-        default=50,
-        help="Number of synthetic symbols (default: 50)",
-    )
-    parser.add_argument(
-        "--n-bars",
-        type=int,
-        default=2000,
-        help="Number of bars per symbol (default: 2000)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./synthetic_data",
-        help="Output directory (default: ./synthetic_data)",
-    )
-    parser.add_argument(
-        "--output-name",
-        type=str,
-        default="synthetic",
-        help="Base name for output files (default: synthetic)",
-    )
-    parser.add_argument(
-        "--kernel-type",
-        choices=["rbf", "matern", "periodic"],
-        default="matern",
-        help="GP kernel type for --method gp (default: matern)",
-    )
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default="2024-01-01",
-        help="Start date for synthetic data (default: 2024-01-01)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed logging",
-    )
-
-    args = parser.parse_args()
-
-    if args.verbose:
-        print(f"Generating synthetic data:")
-        print(f"  Method: {args.method}")
-        print(f"  Symbols: {args.n_symbols}")
-        print(f"  Bars: {args.n_bars}")
-        print(f"  Output: {args.output_dir}")
-        if args.method == "gp":
-            print(f"  Kernel: {args.kernel_type}")
-        if args.seed:
-            print(f"  Seed: {args.seed}")
-
-    gen = SyntheticDatasetGenerator(output_dir=args.output_dir, seed=args.seed)
-
-    try:
-        parquet_path, metadata_path = gen.generate_and_save(
-            method=args.method,
-            n_symbols=args.n_symbols,
-            n_bars=args.n_bars,
-            start_date=args.start_date,
-            output_name=args.output_name,
-            kernel_type=args.kernel_type if args.method == "gp" else None,
-        )
-
-        if args.verbose:
-            print(f"\nSuccess!")
-            print(f"  Parquet: {parquet_path}")
-            print(f"  Metadata: {metadata_path}")
-        else:
-            print(f"✓ {parquet_path}")
-            print(f"✓ {metadata_path}")
-
+    if args.format == "univariate":
+        out_path = Path(args.output_dir) / f"kernelsynth_n{args.n}.npy"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_path, series)
+        print(f"wrote {series.shape} → {out_path}")
         return 0
 
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        return 1
+    # OHLCV format
+    df = batch_to_ohlcv(
+        series,
+        symbol_prefix=args.symbol_prefix,
+        start_date=args.start_date,
+        config=OHLCVConfig(start_price=args.start_price),
+        seed=args.seed,
+    )
+    out_path = Path(args.output_dir) / f"kernelsynth_year={args.year}.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    print(f"wrote {len(df):,} OHLCV rows × {df['symbol'].nunique()} symbols → {out_path}")
+    return 0
+
+
+def _cmd_tsmixup(args: argparse.Namespace) -> int:
+    src_paths = [Path(p) for p in args.source]
+    sources = [parquet_column_source(p, args.column) for p in src_paths]
+    print(f"generating {args.n} TSMixup augmentations from {len(sources)} source(s) "
+          f"on column '{args.column}' (K={args.K}, α={args.alpha})...")
+    out = generate_tsmixup_dataset(
+        sources, n_series=args.n,
+        K=args.K, alpha=args.alpha,
+        l_min=args.l_min, l_max=args.l_max, seed=args.seed,
+    )
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({
+        "augmentation_id": np.arange(len(out), dtype=np.int64),
+        "length": [len(x) for x in out],
+        "values": [x.tolist() for x in out],
+    })
+    df.to_parquet(out_path, index=False)
+    print(f"wrote {len(df):,} variable-length augmentations → {out_path} "
+          f"(lengths {df['length'].min()}–{df['length'].max()})")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    # ---- kernelsynth ----
+    ks = sub.add_parser("kernelsynth",
+                        help="generate KernelSynth synthetic series (Algorithm 2)")
+    ks.add_argument("--n", type=int, default=100, help="number of series")
+    ks.add_argument("--length", type=int, default=1024, help="l_syn (paper default 1024)")
+    ks.add_argument("--j-max", type=int, default=5, help="J (max kernels per series)")
+    ks.add_argument("--seed", type=int, default=0)
+    ks.add_argument("--format", choices=("ohlcv", "univariate"), default="ohlcv",
+                    help="ohlcv = build OHLCV bars (default); univariate = raw .npy")
+    ks.add_argument("--symbol-prefix", default="SYN")
+    ks.add_argument("--start-date", default="2024-01-02 14:30")
+    ks.add_argument("--start-price", type=float, default=100.0)
+    ks.add_argument("--year", type=int, default=2024)
+    ks.add_argument("--output-dir", default="./synthetic_data")
+    ks.set_defaults(func=_cmd_kernelsynth)
+
+    # ---- tsmixup ----
+    tm = sub.add_parser("tsmixup",
+                        help="generate TSMixup augmentations from real series (Algorithm 1)")
+    tm.add_argument("--source", nargs="+", required=True,
+                    help="one or more source parquet files (each treated as one dataset)")
+    tm.add_argument("--column", required=True,
+                    help="column name to extract (e.g. 'close')")
+    tm.add_argument("--n", type=int, default=1000)
+    tm.add_argument("--K", type=int, default=3, help="max series to mix (paper K=3)")
+    tm.add_argument("--alpha", type=float, default=1.5, help="Dirichlet α (paper 1.5)")
+    tm.add_argument("--l-min", type=int, default=128)
+    tm.add_argument("--l-max", type=int, default=2048)
+    tm.add_argument("--seed", type=int, default=0)
+    tm.add_argument("--output", default="./tsmixup_augmentations.parquet")
+    tm.set_defaults(func=_cmd_tsmixup)
+
+    args = ap.parse_args()
+    return args.func(args)
 
 
 if __name__ == "__main__":

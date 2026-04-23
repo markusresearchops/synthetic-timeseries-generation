@@ -1,0 +1,28 @@
+[project]
+name = "synthetic-timeseries-generation"
+version = "0.2.0"
+description = "Paper-faithful KernelSynth + TSMixup (Chronos, Ansari et al. 2024) for synthetic time series generation"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26.0",
+  "scipy>=1.13.0",
+  "pandas>=2.2.0",
+  "pyarrow>=16.0.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["synthetic_timeseries_generation"]
+
+[project.scripts]
+chronos-synth = "synthetic_timeseries_generation.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,173 +1,115 @@
-# Synthetic Time Series Generation
+# synthetic-timeseries-generation
 
-Gaussian Process-based synthetic OHLCV data generation for stock forecasting model training and regularization.
+Paper-faithful implementation of **KernelSynth** (Algorithm 2) and **TSMixup** (Algorithm 1) from:
 
-**Inspired by**: Chronos (Ansari et al., 2024) synthetic data generation approach. The paper demonstrates that pretraining on both real and synthetically-generated time series improves zero-shot generalization across unseen domains.
+> Ansari et al. 2024. *Chronos: Learning the Language of Time Series.* TMLR.
+> https://openreview.net/forum?id=gerNCVqqtR
 
-## Two Data Generation Methods
+Companion to [`tokenized-forecaster`](https://github.com/markusresearchops/tokenized-forecaster) — the OHLCV adapter wraps KernelSynth output so synthetic bars can be fed directly into that pipeline's `consolidate-bars` / `pipeline-mh` stages.
 
-### 1. **Gaussian Process-based Generation** (Primary)
+## What's implemented
 
-Samples from GP priors with various kernel configurations to generate diverse, realistic-looking price paths. This mimics how different market regimes and symbols exhibit different statistical patterns.
+### KernelSynth (Algorithm 2)
+Synthetic time series via Gaussian-process priors composed from a discrete kernel bank:
 
-- **Kernels**: RBF (smooth), Matérn (less smooth, more realistic), Periodic (for seasonality)
-- **Characteristics**: Smooth, continuous patterns with natural autocorrelation structure
-- **Use case**: Improve model robustness to unseen patterns; fill gaps in real data
+- 31-entry kernel bank (paper Table 2): Constant, WhiteNoise (×2), Linear (×3), RBF (×3), RationalQuadratic (×3), Periodic (×19)
+- Algorithm 2 verbatim: sample `j ~ U{1,5}` kernels iid with replacement, compose via random `{+, ×}`, sample from the GP prior at length `l_syn = 1024`
+- Optional provenance logging (kernel names, hyperparameters, operators) for every draw
 
-```python
-from synthetic_timeseries_generation import SyntheticDatasetGenerator
+### TSMixup (Algorithm 1)
+Convex combinations of real time series for diverse augmentation:
 
-gen = SyntheticDatasetGenerator(output_dir="./synthetic")
+- `k ~ U{1, K=3}` series mixed per augmentation
+- Length `l ~ U{l_min=128, l_max=2048}`
+- Mean-scaled before mixing
+- Mixing weights `~ Dir(α=1.5)`
+- Pluggable source interface (`SeriesSource = (rng, length) → array`); helpers for in-memory arrays and parquet columns
 
-# Generate 100 symbols, 2000 bars each using Matérn kernel
-df, metadata = gen.generate_gp_based(
-    n_symbols=100,
-    n_bars=2000,
-    kernel_type="matern"
-)
+### OHLCV adapter (our extension)
+The Chronos paper produces univariate series. For our equity-bar pipeline, we wrap the output as OHLCV bars:
 
-gen.save_parquet(df, name="gp_synthetic")
-```
+- `series_to_ohlcv(series)` — exp-cumsum to get a price path, build OHL/V/barCount around the close path with bounded per-bar noise
+- Output schema matches what `tokenized-forecaster` expects: `date, symbol, open, high, low, close, average, volume, barCount`
 
-### 2. **Parametric Ensemble Generation** (Complementary)
+Not part of the paper — clearly marked as our extension.
 
-Combines multiple well-studied financial process models:
-
-- **GBM** (Geometric Brownian Motion): Standard log-normal price dynamics
-- **Mean-Reverting**: Ornstein-Uhlenbeck-like; captures short-term reversals
-- **Regime-Switching**: Discrete market states (normal/stress trading)
-- **Stochastic Volatility**: Volatility clustering and vol-price correlation (Heston-like)
-
-```python
-# Generate 100 symbols (25 from each model)
-df, metadata = gen.generate_parametric_ensemble(
-    n_symbols=100,
-    n_bars=2000,
-    models=["gbm", "mean_revert", "regime_switch", "sv"]
-)
-
-gen.save_parquet(df, name="parametric_synthetic")
-```
-
-## Integration with tokenized-forecaster
-
-The output format is **directly compatible** with the existing tokenized-forecaster pipeline:
-
-```
-synthetic_data/
-  └── synthetic_year=2024.parquet  # symbol, date, open, high, low, close, volume
-```
-
-Can be consolidated and tokenized using the standard pipeline:
+## Install
 
 ```bash
-# Copy to tokenized-forecaster data directory
-cp synthetic_data/*.parquet ../tokenized-forecaster/data/raw/
-
-# Run standard pipeline (consolidate → fit → apply)
-cd ../tokenized-forecaster
-pipeline-mh --symbols SYN0000,SYN0001,GBM0000 --force
+pip install -e ".[test]"
 ```
 
-## Installation
-
-```bash
-pip install -e .  # with dependencies
-pip install -e ".[test]"  # with test suite
-```
-
-## Usage
-
-### CLI
-
-```bash
-# Generate 50 symbols with Gaussian Processes
-generate-gp-synthetic --method gp --n-symbols 50 --n-bars 2000
-
-# Generate with parametric ensemble
-generate-gp-synthetic --method parametric --n-symbols 40
-
-# Use different kernels
-generate-gp-synthetic --method gp --kernel-type periodic --n-symbols 20
-
-# With seed for reproducibility
-generate-gp-synthetic --method gp --n-symbols 10 --seed 42 --output-dir ./synthetic
-```
-
-### Python API
+## Use as a library
 
 ```python
-from synthetic_timeseries_generation import SyntheticDatasetGenerator, GaussianProcess
 from synthetic_timeseries_generation import (
-    generate_geometric_brownian_motion,
-    generate_mean_reverting_process,
+    kernel_synth, generate_kernel_synth_dataset,
+    tsmixup, generate_tsmixup_dataset, parquet_column_source,
+    series_to_ohlcv, batch_to_ohlcv,
 )
+import numpy as np
 
-# Generate and save
-gen = SyntheticDatasetGenerator(seed=42)
-parquet_path, metadata_path = gen.generate_and_save(
-    method="gp",
-    n_symbols=50,
-    n_bars=2000,
-    kernel_type="matern"
-)
+# 1. KernelSynth — single series with provenance
+rng = np.random.default_rng(0)
+sample = kernel_synth(rng=rng, return_provenance=True)
+print(sample.composition_str)   # e.g. "RBF(l=1) × Periodic(p=24) + Linear(σ=10)"
+print(sample.series.shape)      # (1024,)
 
-# Direct access to lower-level APIs
-from synthetic_timeseries_generation import generate_synthetic_paths
-paths = generate_synthetic_paths(n_paths=100, path_length=500)
+# 2. KernelSynth — batch of 100 univariate series
+arr = generate_kernel_synth_dataset(n_series=100, l_syn=1024, seed=0)
+# arr.shape == (100, 1024)
 
-# GBM paths
-from synthetic_timeseries_generation import generate_geometric_brownian_motion
-prices = generate_geometric_brownian_motion(S0=100, n_steps=1000, n_paths=50)
+# 3. Wrap as OHLCV bars (our adapter, not in paper)
+ohlcv_df = batch_to_ohlcv(arr, symbol_prefix="SYN", seed=0)
+ohlcv_df.to_parquet("synthetic_year=2024.parquet", index=False)
+
+# 4. TSMixup over real data
+sources = [parquet_column_source("aapl_year=2024.parquet", column="close")]
+augmented = generate_tsmixup_dataset(sources, n_series=10_000, seed=0)
+# list of variable-length numpy arrays in [128, 2048]
 ```
 
-## Module Structure
+## Use the CLI
+
+```bash
+# Generate 1000 KernelSynth series as OHLCV bars (drop into tokenized-forecaster)
+chronos-synth kernelsynth --n 1000 --output-dir ./synth_data --year 2024
+
+# Generate 10000 TSMixup augmentations from a real parquet column
+chronos-synth tsmixup --source data/AAPL.parquet --column close --n 10000 \
+                     --output ./tsmixup.parquet
+```
+
+## Layout
 
 ```
 synthetic_timeseries_generation/
-  gp_kernels.py              # Kernel implementations (RBF, Matérn, periodic)
-  gp_processes.py            # GP inference and sampling
-  price_models.py            # Parametric price processes (GBM, MR, RS, SV)
-  synthetic_dataset.py       # End-to-end dataset generation
-  cli.py                     # CLI entry point
+  chronos_kernels.py        # paper Table 2 kernel bank
+  chronos_kernel_synth.py   # Algorithm 2 (KernelSynth)
+  tsmixup.py                # Algorithm 1 (TSMixup)
+  ohlcv_adapter.py          # univariate → OHLCV wrapper (our extension)
+  cli.py                    # CLI: chronos-synth subcommands
+tests/
+  test_chronos_kernels.py
+  test_chronos_kernel_synth.py
+  test_tsmixup.py
+  test_ohlcv_adapter.py
+docs/
+  paper_audit.md            # comparison vs the paper, including history of cleanup
 ```
 
-## Key Design Decisions
+## Tests
 
-1. **Gaussian Processes for diversity**: GPs with different kernels generate statistically-different but realistic paths. Trains the model to handle variety.
+```bash
+pytest                       # all 38 tests
+```
 
-2. **Parametric ensemble for known regimes**: Financial models (GBM, mean-revert, regime-switch, SV) represent distinct market dynamics. Training on all ensures robustness.
+## Why no PyTorch?
 
-3. **No domain-specific tuning to real data**: Synthetic parameters are generic (S0=100, vol~0.1%, etc.), preventing overfitting to observed market conditions.
+KernelSynth and TSMixup are **data-generation scripts**. They produce numpy arrays / parquet files that a downstream model trainer consumes. The paper's own implementation is plain NumPy/SciPy. PyTorch belongs in the model code — see `tokenized-forecaster` for that side of the work.
 
-4. **Parquet + year partition**: Integrates seamlessly with existing tokenized-forecaster infrastructure.
+## History
 
-## Why Both Methods?
+The initial commit (`8765092`) was a partial implementation built from an abstract-only summary of the Chronos paper — it was missing 4 of 6 paper kernels (notably Linear, which is what generates trend), used GP regression instead of GP prior sampling, and lacked TSMixup entirely. Commit `86ff4d3` added the paper-faithful implementation alongside the legacy code; this commit removes the superseded legacy modules, leaving only the paper-faithful path.
 
-- **GP method**: Generates novel patterns the model might not have seen; improves generalization
-- **Parametric method**: Validates that the model learns correct statistical properties of financial time series
-
-This mirrors the Chronos approach: diverse, mathematically-grounded synthetic examples improve zero-shot performance on held-out real datasets.
-
-## Performance Notes
-
-- GP generation: ~500 symbols/minute (CPU, single-threaded)
-- Parametric: ~1000 symbols/minute (vectorized)
-- Memory: ~100 MB per 10K symbols
-
-For large-scale pretraining (millions of symbols), parallelize across cores using multiprocessing.
-
-## References
-
-- **Chronos** (Ansari et al., 2024): "Chronos: Learning the Language of Time Series" — validates that synthetic + real data pretraining improves generalization
-- **Gaussian Processes**: Rasmussen & Williams (2006) — kernel design and inference
-- **Stochastic Volatility**: Heston (1993) — volatility clustering model
-- **Regime-Switching**: Hamilton (1989) — discrete market states
-
-## Future Extensions
-
-- [ ] Multivariate GP (correlated symbols)
-- [ ] Jump-diffusion models (gaps/gaps)
-- [ ] Microstructure effects (bid-ask, slippage)
-- [ ] Intra-day seasonality in volatility
-- [ ] Integration with ARIMA/GARCH for baseline comparison
+See `docs/paper_audit.md` for the original line-by-line audit.
