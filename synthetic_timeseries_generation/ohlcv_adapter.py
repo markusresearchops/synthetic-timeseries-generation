@@ -74,7 +74,15 @@ def series_to_ohlcv(
         rng = np.random.default_rng()
 
     n = len(series)
-    log_returns = config.return_scale * series
+    # Standardise the GP sample to unit-stdev before applying the per-step scale.
+    # KernelSynth output can have arbitrary scale depending on the kernel composition
+    # (e.g. a Linear×Periodic kernel can produce values in the hundreds), which
+    # without standardisation drives exp(cumsum) to 0 or +inf over long paths.
+    # Constant (zero-stdev) input is left as-is, producing a flat price path.
+    sample_std = float(np.std(series))
+    normalised = series if sample_std < 1e-12 else series / sample_std
+
+    log_returns = config.return_scale * normalised
     # Cumulate to a price path, anchored at start_price
     close = config.start_price * np.exp(np.cumsum(log_returns))
 

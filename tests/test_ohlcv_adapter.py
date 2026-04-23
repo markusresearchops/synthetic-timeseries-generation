@@ -88,6 +88,26 @@ def test_batch_to_ohlcv_one_symbol_per_row():
     assert len(df) == 5 * 30
 
 
+def test_series_to_ohlcv_handles_extreme_gp_sample_without_zero_collapse():
+    """A KernelSynth sample with huge variance must not drive prices to 0."""
+    rng = np.random.default_rng(0)
+    # Synthetic GP sample with extreme scale (e.g. Linear×Periodic kernel composition)
+    huge = rng.standard_normal(2000) * 500.0
+    df = series_to_ohlcv(huge, rng=rng, config=OHLCVConfig(start_price=100.0))
+    # No price field should hit zero or go negative
+    for col in ("open", "high", "low", "close", "average"):
+        assert (df[col] > 0).all(), f"{col} hit zero/negative under extreme GP sample"
+
+
+def test_series_to_ohlcv_handles_constant_input():
+    """A degenerate (constant) input produces a flat price path, not an error."""
+    rng = np.random.default_rng(0)
+    df = series_to_ohlcv(np.zeros(100), rng=rng)
+    # All zeros → flat close at start_price (default 100)
+    assert (df["close"] > 0).all()
+    assert (df["close"] - 100.0).abs().max() < 1e-9
+
+
 def test_full_pipeline_kernelsynth_to_ohlcv():
     """End-to-end: KernelSynth → OHLCV → tokenized-forecaster-compatible parquet schema."""
     series = generate_kernel_synth_dataset(n_series=3, l_syn=64, seed=0)
